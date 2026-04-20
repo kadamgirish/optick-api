@@ -1,0 +1,20 @@
+server:
+  port: 8080
+
+dhan:
+  access-token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2NzQyNDIzLCJpYXQiOjE3NzY2NTYwMjMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA3MzUwNjczIn0.DE7RfA7ns7_ClFxXREjhISdnm48_l7h0NZNpQntUa_rq0fn4p_Cs2jUJkYykst2dXVrg4EWcTgi4_NNctvAiIA
+  client-id: 1107350673
+  websocket-url: wss://api-feed.dhan.co
+  master-csv-url: https://images.dhan.co/api-data/api-scrip-master.csv
+  master-csv-cache-dir: cache
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    com.dhan.ticker: DEBUG

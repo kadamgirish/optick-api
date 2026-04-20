@@ -1,0 +1,26 @@
+# Build output
+target/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cached data files
+cache/
+
+# Logs
+*.log
+logs/
+
+# Misc
+find_missing.sh
