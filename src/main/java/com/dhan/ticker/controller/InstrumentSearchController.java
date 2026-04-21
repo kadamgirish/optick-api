@@ -159,7 +159,13 @@ public class InstrumentSearchController {
                     .body(ApiResponse.error("No instruments found for symbol: " + symbol));
         }
 
-        List<String> subscribed = webSocketService.connect(subs, "FULL");
+        List<String> subscribed;
+        // Route through replay-aware path: skip live WS connect + skip OI REST prefetch when replaying
+        if (webSocketService.getFeedSource() == com.dhan.ticker.service.MarketFeedService.FeedSource.REPLAY) {
+            subscribed = webSocketService.prepareSubscriptionState(subs, "FULL");
+        } else {
+            subscribed = webSocketService.connect(subs, "FULL");
+        }
 
         // Register this subscription group for smart unsubscribe
         Set<String> groupIds = subs.stream()
@@ -167,33 +173,36 @@ public class InstrumentSearchController {
                 .collect(Collectors.toSet());
         webSocketService.registerGroup(symbol, groupIds);
 
-        // Fetch OI data: previous_oi + current_oi for options, current_oi for futures
-        Map<String, Long> prevOiMap = new java.util.HashMap<>();
-        Map<String, Long> currOiMap = new java.util.HashMap<>();
+        // Fetch OI data (live mode only): previous_oi + current_oi for options, current_oi for futures.
+        // In replay mode, OI arrives via recorded packets (codes 5, 8) — no REST prefetch needed.
+        if (webSocketService.getFeedSource() != com.dhan.ticker.service.MarketFeedService.FeedSource.REPLAY) {
+            Map<String, Long> prevOiMap = new java.util.HashMap<>();
+            Map<String, Long> currOiMap = new java.util.HashMap<>();
 
-        // Options: fetch both previous_oi and current_oi from Option Chain API
-        if (chain.spot() != null && chain.optionExpiry() != null) {
-            OiSnapshot snap = masterDataService.fetchOptionChainOi(
-                    chain.spot().getSecurityId(),
-                    chain.spot().getExchangeSegment(),
-                    chain.optionExpiry());
-            prevOiMap.putAll(snap.previousOi());
-            currOiMap.putAll(snap.currentOi());
-        }
-
-        // Futures: fetch current OI from Market Quote API
-        if (chain.nearestFuture() != null) {
-            long futOi = masterDataService.fetchFutureOi(
-                    chain.nearestFuture().getExchangeSegment(),
-                    chain.nearestFuture().getSecurityId());
-            if (futOi > 0) {
-                currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
+            // Options: fetch both previous_oi and current_oi from Option Chain API
+            if (chain.spot() != null && chain.optionExpiry() != null) {
+                OiSnapshot snap = masterDataService.fetchOptionChainOi(
+                        chain.spot().getSecurityId(),
+                        chain.spot().getExchangeSegment(),
+                        chain.optionExpiry());
+                prevOiMap.putAll(snap.previousOi());
+                currOiMap.putAll(snap.currentOi());
             }
-        }
 
-        // Pre-populate OI baseline + current OI for immediate oiChange computation
-        if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
-            webSocketService.setInitialOiData(prevOiMap, currOiMap);
+            // Futures: fetch current OI from Market Quote API
+            if (chain.nearestFuture() != null) {
+                long futOi = masterDataService.fetchFutureOi(
+                        chain.nearestFuture().getExchangeSegment(),
+                        chain.nearestFuture().getSecurityId());
+                if (futOi > 0) {
+                    currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
+                }
+            }
+
+            // Pre-populate OI baseline + current OI for immediate oiChange computation
+            if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
+                webSocketService.setInitialOiData(prevOiMap, currOiMap);
+            }
         }
 
         int optCount = chain.callOptions().size() + chain.putOptions().size();
