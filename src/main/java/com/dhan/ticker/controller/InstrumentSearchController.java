@@ -7,6 +7,7 @@ import com.dhan.ticker.service.MasterDataService;
 import com.dhan.ticker.service.MasterDataService.ChainResult;
 import com.dhan.ticker.service.MasterDataService.OiSnapshot;
 import com.dhan.ticker.service.MarketFeedService;
+import com.dhan.ticker.service.ReplayService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.ResponseEntity;
@@ -25,11 +26,14 @@ public class InstrumentSearchController {
 
     private final MasterDataService masterDataService;
     private final MarketFeedService webSocketService;
+    private final ReplayService replayService;
 
     public InstrumentSearchController(MasterDataService masterDataService,
-                                      MarketFeedService webSocketService) {
+                                      MarketFeedService webSocketService,
+                                      ReplayService replayService) {
         this.masterDataService = masterDataService;
         this.webSocketService = webSocketService;
+        this.replayService = replayService;
     }
 
     @GetMapping("/chain")
@@ -107,6 +111,38 @@ public class InstrumentSearchController {
                     "Check logs for live data.")
     public ResponseEntity<ApiResponse> quickSubscribe(@RequestParam String symbol) {
 
+        // REPLAY MODE: use recorded securityIds from the loaded session's manifest.
+        // Today's buildChain() would return a different expiry/ATM strikes than were recorded.
+        if (webSocketService.getFeedSource() == MarketFeedService.FeedSource.REPLAY) {
+            List<ConnectRequest.InstrumentSub> subs = new ArrayList<>(
+                    replayService.getSubscribeRequestsForIndex(symbol));
+
+            // Add constituent stocks (equity secIds are stable across dates)
+            List<IndexInstrument> stocks = masterDataService.getIndexConstituents(symbol);
+            for (IndexInstrument stock : stocks) {
+                ConnectRequest.InstrumentSub sub = new ConnectRequest.InstrumentSub();
+                sub.setSecurityId(stock.getSecurityId());
+                sub.setExchangeSegment(stock.getExchangeSegment());
+                subs.add(sub);
+            }
+
+            if (subs.isEmpty()) {
+                return ResponseEntity.badRequest()
+                        .body(ApiResponse.error("No instruments found in recorded manifest for: " + symbol));
+            }
+
+            List<String> subscribed = webSocketService.prepareSubscriptionState(subs, "FULL");
+            Set<String> groupIds = subs.stream()
+                    .map(sub -> sub.getExchangeSegment() + ":" + sub.getSecurityId())
+                    .collect(Collectors.toSet());
+            webSocketService.registerGroup(symbol, groupIds);
+
+            return ResponseEntity.ok(ApiResponse.ok(String.format(
+                    "Subscribed %d instruments from replay manifest (stocks: %d)",
+                    subscribed.size(), stocks.size())));
+        }
+
+        // LIVE MODE (original path): build today's chain + current ATM + OI baseline
         // 1. Build chain: spot + nearest future + 20 CE/PE
         ChainResult chain = masterDataService.buildChain(symbol, null, 20);
 
@@ -159,13 +195,7 @@ public class InstrumentSearchController {
                     .body(ApiResponse.error("No instruments found for symbol: " + symbol));
         }
 
-        List<String> subscribed;
-        // Route through replay-aware path: skip live WS connect + skip OI REST prefetch when replaying
-        if (webSocketService.getFeedSource() == com.dhan.ticker.service.MarketFeedService.FeedSource.REPLAY) {
-            subscribed = webSocketService.prepareSubscriptionState(subs, "FULL");
-        } else {
-            subscribed = webSocketService.connect(subs, "FULL");
-        }
+        List<String> subscribed = webSocketService.connect(subs, "FULL");
 
         // Register this subscription group for smart unsubscribe
         Set<String> groupIds = subs.stream()
@@ -173,36 +203,33 @@ public class InstrumentSearchController {
                 .collect(Collectors.toSet());
         webSocketService.registerGroup(symbol, groupIds);
 
-        // Fetch OI data (live mode only): previous_oi + current_oi for options, current_oi for futures.
-        // In replay mode, OI arrives via recorded packets (codes 5, 8) — no REST prefetch needed.
-        if (webSocketService.getFeedSource() != com.dhan.ticker.service.MarketFeedService.FeedSource.REPLAY) {
-            Map<String, Long> prevOiMap = new java.util.HashMap<>();
-            Map<String, Long> currOiMap = new java.util.HashMap<>();
+        // Fetch OI data: previous_oi + current_oi for options, current_oi for futures.
+        Map<String, Long> prevOiMap = new java.util.HashMap<>();
+        Map<String, Long> currOiMap = new java.util.HashMap<>();
 
-            // Options: fetch both previous_oi and current_oi from Option Chain API
-            if (chain.spot() != null && chain.optionExpiry() != null) {
-                OiSnapshot snap = masterDataService.fetchOptionChainOi(
-                        chain.spot().getSecurityId(),
-                        chain.spot().getExchangeSegment(),
-                        chain.optionExpiry());
-                prevOiMap.putAll(snap.previousOi());
-                currOiMap.putAll(snap.currentOi());
-            }
+        // Options: fetch both previous_oi and current_oi from Option Chain API
+        if (chain.spot() != null && chain.optionExpiry() != null) {
+            OiSnapshot snap = masterDataService.fetchOptionChainOi(
+                    chain.spot().getSecurityId(),
+                    chain.spot().getExchangeSegment(),
+                    chain.optionExpiry());
+            prevOiMap.putAll(snap.previousOi());
+            currOiMap.putAll(snap.currentOi());
+        }
 
-            // Futures: fetch current OI from Market Quote API
-            if (chain.nearestFuture() != null) {
-                long futOi = masterDataService.fetchFutureOi(
-                        chain.nearestFuture().getExchangeSegment(),
-                        chain.nearestFuture().getSecurityId());
-                if (futOi > 0) {
-                    currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
-                }
+        // Futures: fetch current OI from Market Quote API
+        if (chain.nearestFuture() != null) {
+            long futOi = masterDataService.fetchFutureOi(
+                    chain.nearestFuture().getExchangeSegment(),
+                    chain.nearestFuture().getSecurityId());
+            if (futOi > 0) {
+                currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
             }
+        }
 
-            // Pre-populate OI baseline + current OI for immediate oiChange computation
-            if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
-                webSocketService.setInitialOiData(prevOiMap, currOiMap);
-            }
+        // Pre-populate OI baseline + current OI for immediate oiChange computation
+        if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
+            webSocketService.setInitialOiData(prevOiMap, currOiMap);
         }
 
         int optCount = chain.callOptions().size() + chain.putOptions().size();
