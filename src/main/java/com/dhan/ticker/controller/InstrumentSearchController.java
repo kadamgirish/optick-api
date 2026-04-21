@@ -112,32 +112,34 @@ public class InstrumentSearchController {
     public ResponseEntity<ApiResponse> quickSubscribe(@RequestParam String symbol) {
 
         // REPLAY MODE: use recorded securityIds from the loaded session's manifest.
-        // Today's buildChain() would return a different expiry/ATM strikes than were recorded,
-        // AND today's master CSV no longer contains expired contracts. So build IndexInstruments
-        // directly from the manifest and bypass the master-CSV lookup entirely for F&O/INDEX.
+        // Today's buildChain() would return a different expiry/ATM strikes than were recorded.
         if (webSocketService.getFeedSource() == MarketFeedService.FeedSource.REPLAY) {
-            List<IndexInstrument> direct = new ArrayList<>(
-                    replayService.getIndexInstrumentsForIndex(symbol));
+            List<ConnectRequest.InstrumentSub> subs = new ArrayList<>(
+                    replayService.getSubscribeRequestsForIndex(symbol));
 
-            // Add constituent stocks (equity secIds are stable across dates, master lookup works)
+            // Add constituent stocks (equity secIds are stable across dates)
             List<IndexInstrument> stocks = masterDataService.getIndexConstituents(symbol);
-            direct.addAll(stocks);
+            for (IndexInstrument stock : stocks) {
+                ConnectRequest.InstrumentSub sub = new ConnectRequest.InstrumentSub();
+                sub.setSecurityId(stock.getSecurityId());
+                sub.setExchangeSegment(stock.getExchangeSegment());
+                subs.add(sub);
+            }
 
-            if (direct.isEmpty()) {
+            if (subs.isEmpty()) {
                 return ResponseEntity.badRequest()
                         .body(ApiResponse.error("No instruments found in recorded manifest for: " + symbol));
             }
 
-            List<String> subscribed = webSocketService.prepareSubscriptionStateDirect(direct);
-            Set<String> groupIds = direct.stream()
-                    .map(ii -> ii.getExchangeSegment() + ":" + ii.getSecurityId())
+            List<String> subscribed = webSocketService.prepareSubscriptionState(subs, "FULL");
+            Set<String> groupIds = subs.stream()
+                    .map(sub -> sub.getExchangeSegment() + ":" + sub.getSecurityId())
                     .collect(Collectors.toSet());
             webSocketService.registerGroup(symbol, groupIds);
 
-            long fnoCount = direct.size() - stocks.size();
             return ResponseEntity.ok(ApiResponse.ok(String.format(
-                    "Subscribed %d instruments from replay manifest (F&O+index: %d, stocks: %d)",
-                    subscribed.size(), fnoCount, stocks.size())));
+                    "Subscribed %d instruments from replay manifest (stocks: %d)",
+                    subscribed.size(), stocks.size())));
         }
 
         // LIVE MODE (original path): build today's chain + current ATM + OI baseline
