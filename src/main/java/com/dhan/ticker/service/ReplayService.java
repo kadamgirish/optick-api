@@ -1,7 +1,6 @@
 package com.dhan.ticker.service;
 
 import com.dhan.ticker.exception.WebSocketException;
-import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.DatasetSummary;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -129,12 +128,10 @@ public class ReplayService {
         long[] offsets;
         int[] lengths;
         Instant sessionStart;
-        JsonNode manifestInstruments;
         try {
             JsonNode manifest = mapper.readTree(manifestPath.toFile());
             String startStr = manifest.path("startTime").asText();
             sessionStart = Instant.parse(startStr);
-            manifestInstruments = manifest.path("instruments");
 
             log.info("[REPLAY] Loading index: {} (size={} MB)",
                     idxPath, idxPath.toFile().length() / 1024 / 1024);
@@ -180,7 +177,7 @@ public class ReplayService {
 
         ReplaySession s;
         try {
-            s = new ReplaySession(sessionId, framesPath, tsNanos, offsets, lengths, sessionStart, manifestInstruments);
+            s = new ReplaySession(sessionId, framesPath, tsNanos, offsets, lengths, sessionStart);
         } catch (IOException e) {
             throw new RuntimeException("Failed to open frames.bin: " + e.getMessage(), e);
         }
@@ -301,60 +298,6 @@ public class ReplayService {
         return m;
     }
 
-    /**
-     * Build subscribe requests for a specific index from the currently-loaded
-     * session's manifest.instruments[]. This matters because recorded securityIds
-     * (future expiry, option strikes) no longer match today's live chain.
-     *
-     * Filters by tag+tradingSymbol prefix:
-     *   - INDEX        → tag="INDEX" and tradingSymbol==indexSymbol
-     *   - FUTURE       → tag="FUTURE" and tradingSymbol startsWith indexSymbol+"-"
-     *   - OPTIONS      → tag starts with "CE_"/"PE_" and tradingSymbol startsWith indexSymbol+"-"
-     *
-     * Spot gets feedMode=TICKER (IDX_I constraint); everything else uses default feedMode.
-     * Returns empty list if no matches or no session loaded.
-     */
-    public List<ConnectRequest.InstrumentSub> getSubscribeRequestsForIndex(String indexSymbol) {
-        ReplaySession s = sessionRef.get();
-        if (s == null || s.manifestInstruments == null || !s.manifestInstruments.isArray()) {
-            return List.of();
-        }
-        String symUpper = indexSymbol.toUpperCase();
-        String prefix = symUpper + "-";
-        List<ConnectRequest.InstrumentSub> out = new ArrayList<>();
-        for (JsonNode inst : s.manifestInstruments) {
-            String tag = inst.path("tag").asText("");
-            String tradingSymbol = inst.path("tradingSymbol").asText("");
-            String securityId = inst.path("securityId").asText(null);
-            String exchangeSegment = inst.path("exchangeSegment").asText(null);
-            if (securityId == null || exchangeSegment == null) continue;
-
-            boolean matches = false;
-            boolean isIndex = false;
-            if ("INDEX".equals(tag)) {
-                // INDEX tag doesn't carry symbol suffix; match on tradingSymbol
-                if (symUpper.equalsIgnoreCase(tradingSymbol)) {
-                    matches = true;
-                    isIndex = true;
-                }
-            } else if ("FUTURE".equals(tag) && tradingSymbol.toUpperCase().startsWith(prefix)) {
-                matches = true;
-            } else if ((tag.startsWith("CE_") || tag.startsWith("PE_"))
-                    && tradingSymbol.toUpperCase().startsWith(prefix)) {
-                matches = true;
-            }
-            if (!matches) continue;
-
-            ConnectRequest.InstrumentSub sub = new ConnectRequest.InstrumentSub();
-            sub.setSecurityId(securityId);
-            sub.setExchangeSegment(exchangeSegment);
-            if (isIndex) sub.setFeedMode("TICKER");
-            out.add(sub);
-        }
-        log.info("[REPLAY] Built {} subscribe requests for index {} from manifest", out.size(), symUpper);
-        return out;
-    }
-
     // ── Playback loop ─────────────────────────────────────────────────────
 
     private void playbackLoop(ReplaySession s) {
@@ -471,7 +414,6 @@ public class ReplayService {
         final int[] lengths;
         final Instant sessionStart;
         final RandomAccessFile raf;
-        final JsonNode manifestInstruments;
 
         final AtomicInteger cursor = new AtomicInteger(0);
         final AtomicBoolean playing = new AtomicBoolean(false);
@@ -482,13 +424,12 @@ public class ReplayService {
 
         ReplaySession(String sessionId, Path framesBin,
                       long[] tsNanos, long[] offsets, int[] lengths,
-                      Instant sessionStart, JsonNode manifestInstruments) throws IOException {
+                      Instant sessionStart) throws IOException {
             this.sessionId = sessionId;
             this.tsNanos = tsNanos;
             this.offsets = offsets;
             this.lengths = lengths;
             this.sessionStart = sessionStart;
-            this.manifestInstruments = manifestInstruments;
             this.raf = new RandomAccessFile(framesBin.toFile(), "r");
         }
     }
