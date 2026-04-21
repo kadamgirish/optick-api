@@ -20,6 +20,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -90,8 +92,8 @@ public class ReplayService {
                         .sessionId(m.path("sessionId").asText(f.getName()))
                         .basketPreset(m.path("basketPreset").asText(null))
                         .feedMode(m.path("feedMode").asText(null))
-                        .startTime(start)
-                        .endTime(end)
+                        .startTime(toIst(start))
+                        .endTime(toIst(end))
                         .durationSeconds(duration)
                         .instrumentCount(instrumentCount)
                         .framesBinSizeBytes(framesBin.length())
@@ -186,7 +188,7 @@ public class ReplayService {
         Map<String, Object> info = new LinkedHashMap<>();
         info.put("sessionId", sessionId);
         info.put("totalFrames", tsNanos.length);
-        info.put("sessionStart", sessionStart.toString());
+        info.put("sessionStart", toIst(sessionStart.toString()));
         info.put("durationSeconds", tsNanos.length > 0
                 ? Duration.ofNanos(tsNanos[tsNanos.length - 1] - tsNanos[0]).getSeconds() : 0);
         return info;
@@ -234,7 +236,17 @@ public class ReplayService {
     public void seek(String isoTime) {
         ReplaySession s = sessionRef.get();
         if (s == null) throw new IllegalStateException("No session loaded");
-        Instant target = Instant.parse(isoTime);
+        Instant target;
+        try {
+            target = Instant.parse(isoTime);
+        } catch (Exception e) {
+            // Accept IST-formatted input like 2026-04-17T09:00:38+05:30 or 2026-04-17T09:00:38
+            try {
+                target = java.time.OffsetDateTime.parse(isoTime).toInstant();
+            } catch (Exception e2) {
+                target = java.time.LocalDateTime.parse(isoTime).atZone(IST).toInstant();
+            }
+        }
         long offsetNanos = Duration.between(s.sessionStart, target).toNanos();
         long targetNanoVal = s.tsNanos[0] + offsetNanos;
         int idx = lowerBound(s.tsNanos, targetNanoVal);
@@ -281,8 +293,8 @@ public class ReplayService {
         m.put("cursor", cur);
         m.put("totalFrames", total);
         m.put("progressPct", total > 0 ? (100.0 * cur / total) : 0.0);
-        m.put("sessionStart", s.sessionStart.toString());
-        m.put("currentTime", curWall.toString());
+        m.put("sessionStart", toIst(s.sessionStart.toString()));
+        m.put("currentTime", toIst(curWall.toString()));
         return m;
     }
 
@@ -340,6 +352,20 @@ public class ReplayService {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
+
+    private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
+    private static final DateTimeFormatter IST_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSXXX").withZone(IST);
+
+    /** Format an ISO-8601 UTC instant string as IST (Asia/Kolkata). Returns null on null/invalid input. */
+    static String toIst(String isoUtc) {
+        if (isoUtc == null || isoUtc.isBlank()) return null;
+        try {
+            return IST_FMT.format(Instant.parse(isoUtc));
+        } catch (Exception e) {
+            return isoUtc;
+        }
+    }
 
     private Path resolveFolder(String sessionId) {
         Path p = Paths.get(dataDir, sessionId);
