@@ -147,61 +147,6 @@ public class MarketFeedService {
         this.messagingTemplate = messagingTemplate;
     }
 
-    // ── Feed source (LIVE vs REPLAY, mutually exclusive) ──────────────────
-
-    public enum FeedSource { NONE, LIVE, REPLAY }
-
-    private final AtomicReference<FeedSource> feedSource = new AtomicReference<>(FeedSource.NONE);
-
-    public FeedSource getFeedSource() { return feedSource.get(); }
-
-    public void setFeedSource(FeedSource source) {
-        feedSource.set(source);
-        log.info("[FEED] Source set to {}", source);
-    }
-
-    /** Package-private entry point for replayed binary frames. Reuses live decoder. */
-    void ingestFrame(ByteBuffer buffer) {
-        lastTickTime.set(System.currentTimeMillis());
-        if (!paused.get()) {
-            handleBinaryMessage(buffer);
-        }
-    }
-
-    /**
-     * Populate subscription state (subscribedInstruments) WITHOUT opening a live WebSocket.
-     * Used during replay mode so recorded frames can flow through handleBinaryMessage()
-     * and be matched against subscribedInstruments for routing / broadcast.
-     */
-    public List<String> prepareSubscriptionState(List<ConnectRequest.InstrumentSub> instruments,
-                                                 String defaultFeedMode) {
-        List<ResolvedSub> resolved = resolveInstruments(instruments, defaultFeedMode);
-        if (resolved.isEmpty()) {
-            throw new InvalidInstrumentException("No valid instruments to subscribe");
-        }
-        List<String> added = new ArrayList<>();
-        synchronized (subscriptionStateLock) {
-            for (ResolvedSub r : resolved) {
-                subscribedInstruments.put(instrumentStateKey(r.instrument), r.instrument);
-                added.add(r.instrument.getSymbol() + "(" + r.instrument.getSecurityId() + ")");
-            }
-        }
-        log.info("[REPLAY] Prepared subscription state for {} instruments (no WebSocket)", added.size());
-        return added;
-    }
-
-    /** Clear all subscription state (used when replay session is stopped). */
-    public void clearSubscriptionState() {
-        synchronized (subscriptionStateLock) {
-            subscribedInstruments.clear();
-            subscriptionGroups.clear();
-            prevDayOi.clear();
-            lastTicks.clear();
-            closingTickSent.clear();
-        }
-        log.info("[FEED] Subscription state cleared");
-    }
-
     // ── Subscription group tracking ────────────────────────────────────────
 
     public void registerGroup(String indexSymbol, Set<String> securityIds) {
@@ -271,9 +216,6 @@ public class MarketFeedService {
     // ── Connect & subscribe to multiple instruments ───────────────────────
 
     public List<String> connect(List<ConnectRequest.InstrumentSub> instruments, String defaultFeedMode) {
-        if (feedSource.get() == FeedSource.REPLAY) {
-            throw new WebSocketException("Replay is active. Stop replay (POST /api/replay/stop) before connecting live.");
-        }
         if (connected.get()) {
             // Already connected — append new instruments instead of reconnecting
             return subscribe(instruments, defaultFeedMode);
@@ -332,7 +274,6 @@ public class MarketFeedService {
             client.setConnectionLostTimeout(30);
             client.connect();
             wsClientRef.set(client);
-            feedSource.set(FeedSource.LIVE);
 
             for (ResolvedSub r : resolved) {
                 subscribedInstruments.put(instrumentStateKey(r.instrument), r.instrument);
@@ -417,23 +358,16 @@ public class MarketFeedService {
             lastTicks.clear();
             closingTickSent.clear();
         }
-        if (feedSource.get() == FeedSource.LIVE) {
-            feedSource.set(FeedSource.NONE);
-        }
     }
 
     public void pause() {
-        if (!connected.get() && feedSource.get() != FeedSource.REPLAY) {
-            throw new WebSocketException("Feed is not active");
-        }
+        if (!connected.get()) throw new WebSocketException("WebSocket is not connected");
         paused.set(true);
         log.info("Tick logging paused");
     }
 
     public void resume() {
-        if (!connected.get() && feedSource.get() != FeedSource.REPLAY) {
-            throw new WebSocketException("Feed is not active");
-        }
+        if (!connected.get()) throw new WebSocketException("WebSocket is not connected");
         paused.set(false);
         log.info("Tick logging resumed");
     }
