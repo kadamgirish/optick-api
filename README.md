@@ -52,33 +52,33 @@ Do **not** use `mvn spring-boot:run` — Maven's JVM does not honor the heap fla
 
 ### Master data
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET  | `/api/indices` | List all INDEX instruments (~194) |
-| GET  | `/api/instruments/chain?symbol=&spotPrice=&strikes=10` | Spot + future + CE/PE chain with ready-to-use connect payload |
-| GET  | `/api/instruments/fno?symbol=&type=&optionType=&strike=&limit=50` | F&O search with filters |
-| GET  | `/api/instruments/expiries?symbol=&type=` | Available expiry dates |
+| Method | Path                                                              | Purpose                                                       |
+| ------ | ----------------------------------------------------------------- | ------------------------------------------------------------- |
+| GET    | `/api/indices`                                                    | List all INDEX instruments (~194)                             |
+| GET    | `/api/instruments/chain?symbol=&spotPrice=&strikes=10`            | Spot + future + CE/PE chain with ready-to-use connect payload |
+| GET    | `/api/instruments/fno?symbol=&type=&optionType=&strike=&limit=50` | F&O search with filters                                       |
+| GET    | `/api/instruments/expiries?symbol=&type=`                         | Available expiry dates                                        |
 
 ### Subscription management
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/instruments/subscribe?symbol=` | One-click subscribe: spot + future + 20 CE/PE + constituent stocks |
-| POST | `/api/instruments/unsubscribe?symbol=` | Unsubscribe an index (keeps stocks shared with other active groups) |
-| GET  | `/api/instruments/subscribed-groups` | Active index subscriptions with instrument counts |
-| GET  | `/api/instruments/subscribed-by-index/{symbol}` | Full instrument list for a specific subscribed index (use on page reload to restore frontend state) |
+| Method | Path                                            | Purpose                                                                                             |
+| ------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| POST   | `/api/instruments/subscribe?symbol=`            | One-click subscribe: spot + future + 20 CE/PE + constituent stocks                                  |
+| POST   | `/api/instruments/unsubscribe?symbol=`          | Unsubscribe an index (keeps stocks shared with other active groups)                                 |
+| GET    | `/api/instruments/subscribed-groups`            | Active index subscriptions with instrument counts                                                   |
+| GET    | `/api/instruments/subscribed-by-index/{symbol}` | Full instrument list for a specific subscribed index (use on page reload to restore frontend state) |
 
 ### Low-level WebSocket control
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/ws/connect` | Connect & subscribe arbitrary instruments |
-| POST | `/api/ws/subscribe` | Add instruments to existing connection |
-| POST | `/api/ws/unsubscribe` | Remove instruments by securityId list |
-| POST | `/api/ws/disconnect` | Disconnect WebSocket |
-| POST | `/api/ws/pause` | Pause tick logging |
-| POST | `/api/ws/resume` | Resume tick logging |
-| GET  | `/api/ws/status` | Connection status + subscribed instruments |
+| Method | Path                  | Purpose                                    |
+| ------ | --------------------- | ------------------------------------------ |
+| POST   | `/api/ws/connect`     | Connect & subscribe arbitrary instruments  |
+| POST   | `/api/ws/subscribe`   | Add instruments to existing connection     |
+| POST   | `/api/ws/unsubscribe` | Remove instruments by securityId list      |
+| POST   | `/api/ws/disconnect`  | Disconnect WebSocket                       |
+| POST   | `/api/ws/pause`       | Pause tick logging                         |
+| POST   | `/api/ws/resume`      | Resume tick logging                        |
+| GET    | `/api/ws/status`      | Connection status + subscribed instruments |
 
 ## Architecture
 
@@ -111,6 +111,6 @@ Unsubscribing an index removes only securityIds not owned by any other active gr
 
 ## Notes
 
-- Dhan CSV `securityId` values are **not unique across segments** (e.g. secId 25 = ADANIENT equity *and* BANKNIFTY index). Internal map keys are composite `exchangeSegment:securityId`.
+- Dhan CSV `securityId` values are **not unique across segments** (e.g. secId 25 = ADANIENT equity _and_ BANKNIFTY index). Internal map keys are composite `exchangeSegment:securityId`.
 - `IDX_I` instruments only support `TICKER` feed mode — `QUOTE` / `FULL` are silently ignored by Dhan.
 - Access token and client ID are stored in `application.yml` (not environment variables) per user preference.
