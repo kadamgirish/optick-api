@@ -2,8 +2,8 @@ server:
   port: 8080
 
 dhan:
-  access-token: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzc2ODI5NzkzLCJpYXQiOjE3NzY3NDMzOTMsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTA3MzUwNjczIn0.YP55yeEXc7mwLxj8s7vaQP1slLpYAmEpgEHbMEVSyxoRzXOlaxsQzjijZxkdjJjHQ3mTqA-u4WLlkdaXOe7gWg
-  client-id: 1107350673
+  access-token: your-access-token
+  client-id: client-id
   websocket-url: wss://api-feed.dhan.co
   master-csv-url: https://images.dhan.co/api-data/api-scrip-master.csv
   master-csv-cache-dir: cache
