@@ -917,13 +917,6 @@ public class MarketFeedService {
     }
 
     private boolean isMarketOpen() {
-        // During REPLAY, the source data is already a past market session — treat
-        // as always "open" so recorded ticks flow through to STOMP subscribers
-        // regardless of real-world wall-clock time.
-        if (feedSource.get() == FeedSource.REPLAY) {
-            marketClosedLogged.set(false);
-            return true;
-        }
         ZonedDateTime now = ZonedDateTime.now(IST);
         DayOfWeek day = now.getDayOfWeek();
         if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
