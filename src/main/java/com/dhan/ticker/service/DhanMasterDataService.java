@@ -514,6 +514,147 @@ public class DhanMasterDataService {
         return strikes.get(strikes.size() / 2);
     }
 
+    /**
+     * OI snapshot from Option Chain API: previous day OI + current OI per security.
+     */
+    public record OiSnapshot(Map<String, Long> previousOi, Map<String, Long> currentOi) {}
+
+    /**
+     * Fetch previous day OI AND current OI for all options via Dhan Option Chain API.
+     * Returns OiSnapshot with both maps keyed by securityId.
+     */
+    public OiSnapshot fetchOptionChainOi(String spotSecurityId, String spotSegment, String expiry) {
+        Map<String, Long> prevResult = new HashMap<>();
+        Map<String, Long> currResult = new HashMap<>();
+        try {
+            String expiryDate = expiry.substring(0, Math.min(10, expiry.length()));
+            String body = String.format(
+                    "{\"UnderlyingScrip\":%s,\"UnderlyingSeg\":\"%s\",\"Expiry\":\"%s\"}",
+                    spotSecurityId, spotSegment, expiryDate);
+
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.dhan.co/v2/optionchain"))
+                    .timeout(Duration.ofSeconds(15))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("access-token", accessToken)
+                    .header("client-id", clientId)
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 200) {
+                String json = response.body();
+                // JSON keys are alphabetical per CE/PE block:
+                //   "oi":..., "previous_close_price":..., "previous_oi":..., "previous_volume":..., "security_id":...
+                // We find "previous_oi" first (it comes before "security_id"),
+                // then backtrack to find "oi" for the same block (between previous block boundary and "previous_oi").
+                int searchFrom = 0;
+                while (true) {
+                    int prevOiIdx = json.indexOf("\"previous_oi\"", searchFrom);
+                    if (prevOiIdx < 0) break;
+                    int secIdx = json.indexOf("\"security_id\"", prevOiIdx);
+                    int nextPrevOiIdx = json.indexOf("\"previous_oi\"", prevOiIdx + 13);
+                    if (secIdx < 0 || (nextPrevOiIdx > 0 && secIdx > nextPrevOiIdx)) {
+                        searchFrom = prevOiIdx + 13;
+                        continue;
+                    }
+                    // Extract previous_oi value
+                    int oiColon = json.indexOf(':', prevOiIdx + 13);
+                    int oiEnd = json.indexOf(',', oiColon);
+                    if (oiEnd < 0) oiEnd = json.indexOf('}', oiColon);
+                    String prevOiVal = json.substring(oiColon + 1, oiEnd).trim();
+                    // Extract security_id value
+                    int colonIdx = json.indexOf(':', secIdx + 13);
+                    int commaIdx = json.indexOf(',', colonIdx);
+                    String secId = json.substring(colonIdx + 1, commaIdx).trim();
+                    // Extract current "oi" — search backwards from prevOiIdx for nearest "oi":
+                    // Find the last occurrence of "oi": before prevOiIdx that is NOT part of "previous_oi"
+                    long currOi = 0;
+                    int oiSearchEnd = prevOiIdx;
+                    // Look for standalone "oi" key between the CE/PE block start and "previous_oi"
+                    int blockStart = json.lastIndexOf('{', prevOiIdx);
+                    if (blockStart >= 0) {
+                        int oiKeyIdx = json.indexOf("\"oi\"", blockStart);
+                        // Make sure this "oi" is before "previous_oi" and is standalone (not part of "previous_oi")
+                        if (oiKeyIdx >= 0 && oiKeyIdx < prevOiIdx) {
+                            // Verify it's standalone: char before '"' should not be '_'
+                            if (oiKeyIdx == 0 || json.charAt(oiKeyIdx - 1) != '_') {
+                                int curOiColon = json.indexOf(':', oiKeyIdx + 4);
+                                int curOiEnd = json.indexOf(',', curOiColon);
+                                if (curOiEnd < 0) curOiEnd = json.indexOf('}', curOiColon);
+                                String curOiVal = json.substring(curOiColon + 1, curOiEnd).trim();
+                                try { currOi = Long.parseLong(curOiVal); } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                    try {
+                        long prevOi = Long.parseLong(prevOiVal);
+                        if (prevOi > 0) prevResult.put(secId, prevOi);
+                    } catch (NumberFormatException ignored) {}
+                    if (currOi > 0) currResult.put(secId, currOi);
+                    searchFrom = secIdx + 13;
+                }
+                log.info("Fetched OI for {} option strikes from Option Chain API (prevOI={}, currentOI={})",
+                        Math.max(prevResult.size(), currResult.size()), prevResult.size(), currResult.size());
+            } else {
+                log.warn("Option Chain API returned HTTP {}: {}", response.statusCode(),
+                        response.body().substring(0, Math.min(200, response.body().length())));
+            }
+        } catch (Exception e) {
+            log.warn("Failed to fetch Option Chain OI: {}", e.getMessage());
+        }
+        return new OiSnapshot(prevResult, currResult);
+    }
+
+    /**
+     * Fetch current OI for a future instrument via Dhan Market Quote API.
+     * Returns the OI value, or 0 if not available.
+     */
+    public long fetchFutureOi(String exchangeSegment, String securityId) {
+        try {
+            String body = "{\"" + exchangeSegment + "\":[" + securityId + "]}";
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.dhan.co/v2/marketfeed/quote"))
+                    .timeout(Duration.ofSeconds(10))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("access-token", accessToken)
+                    .header("client-id", clientId)
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == 200) {
+                String json = response.body();
+                // Parse "oi": value — must be standalone, not "previous_oi" or "oi_day_high"
+                String key = "\"oi\":";
+                int idx = 0;
+                while ((idx = json.indexOf(key, idx)) >= 0) {
+                    // Check it's standalone: char before '"' should not be '_' and char after value colon context
+                    if (idx == 0 || json.charAt(idx - 1) != '_') {
+                        int start = idx + key.length();
+                        int end = json.indexOf(',', start);
+                        if (end < 0) end = json.indexOf('}', start);
+                        String val = json.substring(start, end).trim();
+                        long oi = Long.parseLong(val);
+                        if (oi > 0) {
+                            log.info("Fetched future OI for {}:{} = {}", exchangeSegment, securityId, oi);
+                            return oi;
+                        }
+                    }
+                    idx += key.length();
+                }
+            } else {
+                log.warn("Market Quote API returned HTTP {}: {}", response.statusCode(), response.body());
+            }
+        } catch (Exception e) {
+            log.warn("Failed to fetch future OI for {}:{} — {}", exchangeSegment, securityId, e.getMessage());
+        }
+        return 0;
+    }
+
     public record ChainResult(
             IndexInstrument spot,
             IndexInstrument nearestFuture,

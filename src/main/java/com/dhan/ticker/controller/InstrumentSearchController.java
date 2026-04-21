@@ -5,6 +5,7 @@ import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.IndexInstrument;
 import com.dhan.ticker.service.DhanMasterDataService;
 import com.dhan.ticker.service.DhanMasterDataService.ChainResult;
+import com.dhan.ticker.service.DhanMasterDataService.OiSnapshot;
 import com.dhan.ticker.service.DhanWebSocketService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -13,6 +14,9 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/instruments")
@@ -157,6 +161,41 @@ public class InstrumentSearchController {
 
         List<String> subscribed = webSocketService.connect(subs, "FULL");
 
+        // Register this subscription group for smart unsubscribe
+        Set<String> groupIds = subs.stream()
+            .map(sub -> sub.getExchangeSegment() + ":" + sub.getSecurityId())
+                .collect(Collectors.toSet());
+        webSocketService.registerGroup(symbol, groupIds);
+
+        // Fetch OI data: previous_oi + current_oi for options, current_oi for futures
+        Map<String, Long> prevOiMap = new java.util.HashMap<>();
+        Map<String, Long> currOiMap = new java.util.HashMap<>();
+
+        // Options: fetch both previous_oi and current_oi from Option Chain API
+        if (chain.spot() != null && chain.optionExpiry() != null) {
+            OiSnapshot snap = masterDataService.fetchOptionChainOi(
+                    chain.spot().getSecurityId(),
+                    chain.spot().getExchangeSegment(),
+                    chain.optionExpiry());
+            prevOiMap.putAll(snap.previousOi());
+            currOiMap.putAll(snap.currentOi());
+        }
+
+        // Futures: fetch current OI from Market Quote API
+        if (chain.nearestFuture() != null) {
+            long futOi = masterDataService.fetchFutureOi(
+                    chain.nearestFuture().getExchangeSegment(),
+                    chain.nearestFuture().getSecurityId());
+            if (futOi > 0) {
+                currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
+            }
+        }
+
+        // Pre-populate OI baseline + current OI for immediate oiChange computation
+        if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
+            webSocketService.setInitialOiData(prevOiMap, currOiMap);
+        }
+
         int optCount = chain.callOptions().size() + chain.putOptions().size();
         String detail = String.format("Spot: %s (TICKER), Future: %s exp %s (FULL), " +
                         "Options: %d CE + %d PE exp %s (FULL), Stocks: %d (FULL)",
@@ -170,7 +209,35 @@ public class InstrumentSearchController {
         return ResponseEntity.ok(ApiResponse.ok("Subscribed " + subscribed.size()
                 + " instruments — " + detail));
     }
+    @PostMapping("/unsubscribe")
+    @Operation(summary = "Unsubscribe an index and all its instruments",
+            description = "Removes spot, future, options, and constituent stocks for the given index. " +
+                    "Stocks shared with other active subscriptions are kept. " +
+                    "If no subscriptions remain, WebSocket disconnects automatically.")
+    public ResponseEntity<ApiResponse> quickUnsubscribe(@RequestParam String symbol) {
+        Map<String, Object> result = webSocketService.unsubscribeBySymbol(symbol);
+        return ResponseEntity.ok(ApiResponse.ok(String.format(
+                "Unsubscribed %s: %s removed, %s shared kept. Active: %s (total: %s)",
+                result.get("symbol"), result.get("removed"), result.get("keptShared"),
+                result.get("activeGroups"), result.get("totalSubscribed"))));
+    }
 
+    @GetMapping("/subscribed-groups")
+    @Operation(summary = "List active subscription groups",
+            description = "Returns which indices are currently subscribed and how many instruments each has.")
+    public ResponseEntity<Map<String, Integer>> subscribedGroups() {
+        return ResponseEntity.ok(webSocketService.getSubscriptionGroups());
+    }
+
+    @GetMapping("/subscribed-by-index/{symbol}")
+    @Operation(summary = "Get all instruments subscribed for a specific index",
+            description = "Returns the exact list of instruments (spot, future, options, constituent stocks) " +
+                    "currently subscribed for the given index symbol. " +
+                    "Returns empty array if the index is not currently subscribed. " +
+                    "Use on page load or after subscribe to rebuild secId-to-index mappings on the frontend.")
+    public ResponseEntity<List<IndexInstrument>> subscribedByIndex(@PathVariable String symbol) {
+        return ResponseEntity.ok(webSocketService.getInstrumentsByGroup(symbol));
+    }
     @GetMapping("/fno")
     @Operation(summary = "Search F&O instruments with filters",
             description = "Finds nearest expiry futures & options for a symbol. " +

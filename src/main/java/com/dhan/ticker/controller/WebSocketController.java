@@ -3,6 +3,7 @@ package com.dhan.ticker.controller;
 import com.dhan.ticker.model.ApiResponse;
 import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.IndexInstrument;
+import com.dhan.ticker.model.TickData;
 import com.dhan.ticker.service.DhanWebSocketService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -10,6 +11,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/ws")
@@ -78,6 +80,29 @@ public class WebSocketController {
                 webSocketService.isPaused(),
                 webSocketService.getSubscribedInstruments()
         ));
+    }
+
+    @GetMapping("/subscribed-instruments")
+    @Operation(summary = "List all currently subscribed instruments",
+            description = "Returns the full list of subscribed IndexInstrument objects. " +
+                    "Use this to build the Angular dashboard layout before ticks arrive.")
+    public ResponseEntity<List<IndexInstrument>> subscribedInstruments() {
+        return ResponseEntity.ok(webSocketService.getSubscribedInstruments());
+    }
+
+    @GetMapping("/last-ticks")
+    @Operation(summary = "Last known tick for every subscribed instrument",
+            description = "Returns the most recent TickData per symbol. Available even after market close — " +
+                    "use this to populate the dashboard with closing data.")
+    public ResponseEntity<Map<String, TickData>> lastTicks() {
+        return ResponseEntity.ok(webSocketService.getLastTicks());
+    }
+
+    @GetMapping("/prev-day-oi")
+    @Operation(summary = "Debug: show loaded previous day OI map",
+            description = "Returns securityId -> previousDayOI for all instruments where baseline is set.")
+    public ResponseEntity<Map<String, Long>> prevDayOi() {
+        return ResponseEntity.ok(webSocketService.getPrevDayOiMap());
     }
 
     public record StatusResponse(
