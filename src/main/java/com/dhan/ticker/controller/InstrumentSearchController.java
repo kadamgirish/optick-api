@@ -3,10 +3,10 @@ package com.dhan.ticker.controller;
 import com.dhan.ticker.model.ApiResponse;
 import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.IndexInstrument;
-import com.dhan.ticker.service.DhanMasterDataService;
-import com.dhan.ticker.service.DhanMasterDataService.ChainResult;
-import com.dhan.ticker.service.DhanMasterDataService.OiSnapshot;
-import com.dhan.ticker.service.DhanWebSocketService;
+import com.dhan.ticker.service.MasterDataService;
+import com.dhan.ticker.service.MasterDataService.ChainResult;
+import com.dhan.ticker.service.MasterDataService.OiSnapshot;
+import com.dhan.ticker.service.MarketFeedService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.ResponseEntity;
@@ -23,11 +23,11 @@ import java.util.stream.Collectors;
 @Tag(name = "Instrument Search", description = "Search F&O instruments and get ready-to-use subscribe payloads")
 public class InstrumentSearchController {
 
-    private final DhanMasterDataService masterDataService;
-    private final DhanWebSocketService webSocketService;
+    private final MasterDataService masterDataService;
+    private final MarketFeedService webSocketService;
 
-    public InstrumentSearchController(DhanMasterDataService masterDataService,
-                                      DhanWebSocketService webSocketService) {
+    public InstrumentSearchController(MasterDataService masterDataService,
+                                      MarketFeedService webSocketService) {
         this.masterDataService = masterDataService;
         this.webSocketService = webSocketService;
     }

@@ -30,7 +30,7 @@ import java.util.stream.Collectors;
 
 @Slf4j
 @Service
-public class DhanWebSocketService {
+public class MarketFeedService {
 
     @Value("${dhan.websocket-url}")
     private String websocketUrl;
@@ -41,7 +41,7 @@ public class DhanWebSocketService {
     @Value("${dhan.client-id}")
     private String clientId;
 
-    private final DhanMasterDataService masterDataService;
+    private final MasterDataService masterDataService;
     private final SimpMessagingTemplate messagingTemplate;
 
     private final AtomicReference<WebSocketClient> wsClientRef = new AtomicReference<>();
@@ -141,8 +141,8 @@ public class DhanWebSocketService {
             "FULL", 21
     );
 
-    public DhanWebSocketService(DhanMasterDataService masterDataService,
-                                SimpMessagingTemplate messagingTemplate) {
+    public MarketFeedService(MasterDataService masterDataService,
+                             SimpMessagingTemplate messagingTemplate) {
         this.masterDataService = masterDataService;
         this.messagingTemplate = messagingTemplate;
     }

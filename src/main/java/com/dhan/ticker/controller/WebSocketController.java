@@ -4,7 +4,7 @@ import com.dhan.ticker.model.ApiResponse;
 import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.IndexInstrument;
 import com.dhan.ticker.model.TickData;
-import com.dhan.ticker.service.DhanWebSocketService;
+import com.dhan.ticker.service.MarketFeedService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.ResponseEntity;
@@ -18,9 +18,9 @@ import java.util.Map;
 @Tag(name = "WebSocket Control", description = "Connect, subscribe, disconnect, pause, resume tick feed")
 public class WebSocketController {
 
-    private final DhanWebSocketService webSocketService;
+    private final MarketFeedService webSocketService;
 
-    public WebSocketController(DhanWebSocketService webSocketService) {
+    public WebSocketController(MarketFeedService webSocketService) {
         this.webSocketService = webSocketService;
     }
 

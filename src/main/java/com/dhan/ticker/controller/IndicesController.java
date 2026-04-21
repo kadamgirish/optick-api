@@ -1,7 +1,7 @@
 package com.dhan.ticker.controller;
 
 import com.dhan.ticker.model.IndexInstrument;
-import com.dhan.ticker.service.DhanMasterDataService;
+import com.dhan.ticker.service.MasterDataService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.ResponseEntity;
@@ -16,9 +16,9 @@ import java.util.List;
 @Tag(name = "Indices", description = "Master data - available INDEX instruments")
 public class IndicesController {
 
-    private final DhanMasterDataService masterDataService;
+    private final MasterDataService masterDataService;
 
-    public IndicesController(DhanMasterDataService masterDataService) {
+    public IndicesController(MasterDataService masterDataService) {
         this.masterDataService = masterDataService;
     }
 

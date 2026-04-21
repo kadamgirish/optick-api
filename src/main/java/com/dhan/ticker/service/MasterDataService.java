@@ -24,7 +24,7 @@ import java.util.stream.Collectors;
 
 @Slf4j
 @Service
-public class DhanMasterDataService {
+public class MasterDataService {
 
     @Value("${dhan.master-csv-url}")
     private String masterCsvUrl;

@@ -6,9 +6,9 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 
 @SpringBootApplication
 @EnableScheduling
-public class DhanTickerApplication {
+public class OptickApplication {
 
     public static void main(String[] args) {
-        SpringApplication.run(DhanTickerApplication.class, args);
+        SpringApplication.run(OptickApplication.class, args);
     }
 }
