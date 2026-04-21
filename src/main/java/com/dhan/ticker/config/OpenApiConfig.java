@@ -13,9 +13,9 @@ public class OpenApiConfig {
     public OpenAPI customOpenAPI() {
         return new OpenAPI()
                 .info(new Info()
-                        .title("Dhan Tick Logger API")
+                        .title("Optick API")
                         .version("1.0.0")
-                        .description("Connect to Dhan WebSocket, select an index, and log live tick data")
+                        .description("Live options tick data, OI tracking, and multi-index subscription via Dhan WebSocket")
                         .contact(new Contact().name("Developer")));
     }
 }

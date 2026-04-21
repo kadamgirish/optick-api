@@ -12,10 +12,10 @@
     </parent>
 
     <groupId>com.dhan</groupId>
-    <artifactId>dhan-ticker</artifactId>
+    <artifactId>optick-api</artifactId>
     <version>1.0.0</version>
-    <name>dhan-ticker</name>
-    <description>Dhan WebSocket Tick Logger</description>
+    <name>optick-api</name>
+    <description>Optick API - Live options tick data and OI tracking via Dhan WebSocket</description>
 
     <properties>
         <java.version>17</java.version>
