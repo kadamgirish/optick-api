@@ -3,6 +3,7 @@ package com.dhan.ticker.service;
 import com.dhan.ticker.exception.WebSocketException;
 import com.dhan.ticker.model.ConnectRequest;
 import com.dhan.ticker.model.DatasetSummary;
+import com.dhan.ticker.model.IndexInstrument;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -352,6 +353,67 @@ public class ReplayService {
             out.add(sub);
         }
         log.info("[REPLAY] Built {} subscribe requests for index {} from manifest", out.size(), symUpper);
+        return out;
+    }
+
+    /**
+     * Build IndexInstrument objects DIRECTLY from the loaded session's manifest,
+     * bypassing today's master-CSV (which may no longer contain expired contracts).
+     * Includes spot(IDX_I), future, and all options (tag CE_... or PE_...) whose
+     * tradingSymbol starts with indexSymbol+"-", plus the INDEX entry.
+     */
+    public List<IndexInstrument> getIndexInstrumentsForIndex(String indexSymbol) {
+        ReplaySession s = sessionRef.get();
+        if (s == null || s.manifestInstruments == null || !s.manifestInstruments.isArray()) {
+            return List.of();
+        }
+        String symUpper = indexSymbol.toUpperCase();
+        String prefix = symUpper + "-";
+        List<IndexInstrument> out = new ArrayList<>();
+        for (JsonNode inst : s.manifestInstruments) {
+            String tag = inst.path("tag").asText("");
+            String tradingSymbol = inst.path("tradingSymbol").asText("");
+            String securityId = inst.path("securityId").asText(null);
+            String exchangeSegment = inst.path("exchangeSegment").asText(null);
+            if (securityId == null || exchangeSegment == null) continue;
+
+            String instrumentType = null;
+            boolean matches = false;
+            if ("INDEX".equals(tag)) {
+                if (symUpper.equalsIgnoreCase(tradingSymbol)) {
+                    matches = true;
+                    instrumentType = "INDEX";
+                }
+            } else if ("FUTURE".equals(tag) && tradingSymbol.toUpperCase().startsWith(prefix)) {
+                matches = true;
+                instrumentType = "FUTIDX";
+            } else if ((tag.startsWith("CE_") || tag.startsWith("PE_"))
+                    && tradingSymbol.toUpperCase().startsWith(prefix)) {
+                matches = true;
+                instrumentType = "OPTIDX";
+            }
+            if (!matches) continue;
+
+            IndexInstrument ii = new IndexInstrument();
+            ii.setSecurityId(securityId);
+            ii.setExchangeSegment(exchangeSegment);
+            ii.setTradingSymbol(tradingSymbol);
+            ii.setSymbol(symUpper);
+            ii.setDisplayName(tradingSymbol);
+            ii.setInstrumentType(instrumentType);
+            String expiry = inst.path("expiry").asText(null);
+            if (expiry == null) expiry = inst.path("expiryDate").asText(null);
+            if (expiry != null) ii.setExpiryDate(expiry);
+            if (inst.hasNonNull("strike")) {
+                ii.setStrikePrice(inst.path("strike").asText());
+            }
+            String optionType = inst.path("optionType").asText(null);
+            if (optionType == null && tag.startsWith("CE_")) optionType = "CE";
+            else if (optionType == null && tag.startsWith("PE_")) optionType = "PE";
+            if (optionType != null) ii.setOptionType(optionType);
+            out.add(ii);
+        }
+        log.info("[REPLAY] Built {} IndexInstruments for index {} from manifest", out.size(), symUpper);
         return out;
     }
 

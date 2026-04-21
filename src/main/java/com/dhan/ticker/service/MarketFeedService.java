@@ -190,6 +190,25 @@ public class MarketFeedService {
         return added;
     }
 
+    /**
+     * Populate subscription state directly from pre-built IndexInstrument objects,
+     * bypassing the master-CSV lookup. Used in REPLAY mode where recorded secIds
+     * (expired futures/options) may no longer exist in today's master data.
+     */
+    public List<String> prepareSubscriptionStateDirect(List<IndexInstrument> instruments) {
+        List<String> added = new ArrayList<>();
+        if (instruments == null || instruments.isEmpty()) return added;
+        synchronized (subscriptionStateLock) {
+            for (IndexInstrument inst : instruments) {
+                if (inst == null || inst.getSecurityId() == null || inst.getExchangeSegment() == null) continue;
+                subscribedInstruments.put(instrumentStateKey(inst), inst);
+                added.add(inst.getSymbol() + "(" + inst.getSecurityId() + ")");
+            }
+        }
+        log.info("[REPLAY] Prepared subscription state (direct) for {} instruments", added.size());
+        return added;
+    }
+
     /** Clear all subscription state (used when replay session is stopped). */
     public void clearSubscriptionState() {
         synchronized (subscriptionStateLock) {
