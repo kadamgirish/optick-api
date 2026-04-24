@@ -105,10 +105,12 @@ public class MarketFeedService {
             if (!storeTickIfSubscribed(inst, tickKey, tick)) {
                 continue;
             }
-            broadcast(tick, type);
+            // Don't broadcast yet — tick has OI but no LTP. The WS full packet arriving
+            // shortly will pull this cached tick via buildTickUpdate, merge LTP/OHLC,
+            // and broadcast one complete frame (prevents a "LTP=0" flash in the UI).
             preloaded++;
         }
-        log.info("[OI-BROADCAST] Broadcast {} instruments with OI/oiChange via STOMP (prevDayOI={}, currentOI={})",
+        log.info("[OI-PRELOAD] Cached {} instruments with OI/oiChange (prevDayOI={}, currentOI={})",
                 preloaded, prevOiMap.size(), currentOiMap.size());
     }
 
