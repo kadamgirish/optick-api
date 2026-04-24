@@ -159,15 +159,10 @@ public class InstrumentSearchController {
                     .body(ApiResponse.error("No instruments found for symbol: " + symbol));
         }
 
-        List<String> subscribed = webSocketService.connect(subs, "FULL");
-
-        // Register this subscription group for smart unsubscribe
-        Set<String> groupIds = subs.stream()
-            .map(sub -> sub.getExchangeSegment() + ":" + sub.getSecurityId())
-                .collect(Collectors.toSet());
-        webSocketService.registerGroup(symbol, groupIds);
-
-        // Fetch OI data: previous_oi + current_oi for options, current_oi for futures
+        // ── Phase 1: REST snapshots FIRST (before WS subscribe) ───────────────
+        // Dhan data APIs are rate-limited (~1 req/sec). Fetching everything up-front
+        // means by the time the first WS tick arrives, lastTicks already has OHLC/OI
+        // so the first broadcast carries LTP + O/H/L/C (+ OI) together, not separately.
         Map<String, Long> prevOiMap = new java.util.HashMap<>();
         Map<String, Long> currOiMap = new java.util.HashMap<>();
 
@@ -181,19 +176,51 @@ public class InstrumentSearchController {
             currOiMap.putAll(snap.currentOi());
         }
 
-        // Futures: fetch current OI from Market Quote API
+        // Batched quote fetch for spot (O/H/L + prev close) AND future (current OI) in ONE call.
+        // Replaces the old separate /marketfeed/quote for future-OI + /marketfeed/ohlc for spot.
+        Map<String, List<String>> batchReq = new java.util.HashMap<>();
+        if (chain.spot() != null) {
+            batchReq.computeIfAbsent(chain.spot().getExchangeSegment(), k -> new ArrayList<>())
+                    .add(chain.spot().getSecurityId());
+        }
         if (chain.nearestFuture() != null) {
-            long futOi = masterDataService.fetchFutureOi(
-                    chain.nearestFuture().getExchangeSegment(),
-                    chain.nearestFuture().getSecurityId());
-            if (futOi > 0) {
-                currOiMap.put(chain.nearestFuture().getSecurityId(), futOi);
+            batchReq.computeIfAbsent(chain.nearestFuture().getExchangeSegment(), k -> new ArrayList<>())
+                    .add(chain.nearestFuture().getSecurityId());
+        }
+        Map<String, MasterDataService.QuoteRow> quoteBatch = batchReq.isEmpty()
+                ? java.util.Map.of()
+                : masterDataService.fetchQuoteBatch(batchReq);
+
+        // Extract future OI from the batch
+        if (chain.nearestFuture() != null) {
+            MasterDataService.QuoteRow futRow = quoteBatch.get(chain.nearestFuture().getSecurityId());
+            if (futRow != null && futRow.oi() > 0) {
+                currOiMap.put(chain.nearestFuture().getSecurityId(), futRow.oi());
             }
         }
 
-        // Pre-populate OI baseline + current OI for immediate oiChange computation
+        // Extract spot OHLC + prev close from the batch
+        MasterDataService.QuoteRow spotRow = chain.spot() != null
+                ? quoteBatch.get(chain.spot().getSecurityId())
+                : null;
+
+        // ── Phase 2: WS subscribe ─────────────────────────────────────────────
+        List<String> subscribed = webSocketService.connect(subs, "FULL");
+
+        // Register this subscription group for smart unsubscribe
+        Set<String> groupIds = subs.stream()
+            .map(sub -> sub.getExchangeSegment() + ":" + sub.getSecurityId())
+                .collect(Collectors.toSet());
+        webSocketService.registerGroup(symbol, groupIds);
+
+        // ── Phase 3: preload caches so the first WS tick ships with OHLC/OI merged
         if (!prevOiMap.isEmpty() || !currOiMap.isEmpty()) {
             webSocketService.setInitialOiData(prevOiMap, currOiMap);
+        }
+        if (spotRow != null && !spotRow.isEmpty()) {
+            webSocketService.setInitialSpotOhlc(
+                    chain.spot().getSecurityId(),
+                    spotRow.open(), spotRow.high(), spotRow.low(), spotRow.prevClose(), spotRow.ltp());
         }
 
         int optCount = chain.callOptions().size() + chain.putOptions().size();

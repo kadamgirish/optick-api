@@ -9,6 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.BeanUtils;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
@@ -59,6 +60,9 @@ public class MarketFeedService {
     // securityId -> previous day's closing OI (from Option Chain API or PrevClose packet)
     private final Map<String, Long> prevDayOi = new ConcurrentHashMap<>();
 
+    // securityId -> previous day's close price (from PrevClose packet)
+    private final Map<String, Double> prevDayClose = new ConcurrentHashMap<>();
+
     /**
      * Pre-populate previous day OI map before ticks start flowing.
      * Called from controller after fetching from Dhan Option Chain API.
@@ -92,12 +96,13 @@ public class MarketFeedService {
 
             String symbol = inst.getSymbol();
             String type = detectType(inst);
-            TickData tick = buildBaseTick(symbol, type, inst);
+            String tickKey = tickKey(symbol, inst);
+            TickData tick = buildTickUpdate(tickKey, symbol, type, inst);
             tick.setOi((int) currOi);
             tick.setPrevDayOi(prevOi);
             tick.setOiChange(currOi - prevOi);
             tick.setTimestamp(TIME_FMT.format(java.time.ZonedDateTime.now(IST)));
-            if (!storeTickIfSubscribed(inst, tickKey(symbol, inst), tick)) {
+            if (!storeTickIfSubscribed(inst, tickKey, tick)) {
                 continue;
             }
             broadcast(tick, type);
@@ -105,6 +110,64 @@ public class MarketFeedService {
         }
         log.info("[OI-BROADCAST] Broadcast {} instruments with OI/oiChange via STOMP (prevDayOI={}, currentOI={})",
                 preloaded, prevOiMap.size(), currentOiMap.size());
+    }
+
+    /**
+     * Pre-populate OHLC for the spot index (IDX_I) from the REST OHLC API.
+     * IDX_I websocket frames only carry LTP, so today's O/H/L and previous-day close
+     * must be sourced from REST and merged into the cached tick.
+     *
+     * Dhan /v2/marketfeed/ohlc semantics:
+     *   - last_price  = today's LTP
+     *   - ohlc.open   = today's open
+     *   - ohlc.high   = today's high
+     *   - ohlc.low    = today's low
+     *   - ohlc.close  = PREVIOUS trading day's close
+     *
+     * So we map REST `close` into `prevDayClose` (NOT tick.close, which our
+     * domain uses for prev-day close via enrichTickWithPrevDayState).
+     */
+    public void setInitialSpotOhlc(String securityId,
+                                   double open, double high, double low, double close, double ltp) {
+        if (securityId == null) return;
+        IndexInstrument inst;
+        synchronized (subscriptionStateLock) {
+            inst = findSubscribedInstrumentBySecurityId(securityId);
+        }
+        if (inst == null) {
+            log.debug("[SPOT-OHLC] Skipped — no subscribed instrument for securityId={}", securityId);
+            return;
+        }
+
+        if (close > 0) {
+            prevDayClose.put(securityId, close);
+        }
+
+        String symbol = inst.getSymbol();
+        String type = detectType(inst);
+        String tickKey = tickKey(symbol, inst);
+        TickData tick = buildTickUpdate(tickKey, symbol, type, inst);
+        if (open > 0) tick.setOpen(open);
+        if (high > 0) tick.setHigh(high);
+        if (low > 0)  tick.setLow(low);
+        // Seed LTP only if we don't already have one from WS
+        if (ltp > 0 && tick.getLtp() == 0) tick.setLtp(ltp);
+        tick.setTimestamp(TIME_FMT.format(java.time.ZonedDateTime.now(IST)));
+        // Applies prevDayClose -> tick.close and oiChange
+        enrichTickWithPrevDayState(inst, tick);
+
+        if (!storeTickIfSubscribed(inst, tickKey, tick)) {
+            return;
+        }
+        // Avoid broadcasting a tick with close=0 (user-visible "missing prevClose" on first frame).
+        // When REST couldn't supply prev-close, the WS handlePrevClosePacket that follows within
+        // ~150ms will enrich this stored tick and broadcast it with the correct close.
+        boolean hasPrevClose = tick.getClose() > 0;
+        if (hasPrevClose) {
+            broadcast(tick, type);
+        }
+        log.info("[SPOT-OHLC] {} today: O={} H={} L={} LTP={} | prevDayClose(REST close)={} -> tick.close={} | broadcast={}",
+                symbol, open, high, low, ltp, close, tick.getClose(), hasPrevClose);
     }
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -514,23 +577,36 @@ public class MarketFeedService {
         float ltp = buf.getFloat(8);
         int ltt = buf.getInt(12);
 
-        TickData tick = buildBaseTick(symbol, type, inst);
+        String tKey = tickKey(symbol, inst);
+        TickData tick = buildTickUpdate(tKey, symbol, type, inst);
         tick.setLtp(ltp);
         tick.setTimestamp(fmtTime(ltt));
-        String tKey = tickKey(symbol, inst);
+        enrichTickWithPrevDayState(inst, tick);
         if (!storeTickIfSubscribed(inst, tKey, tick)) {
             return;
         }
+
+        // For indices (TICKER-only, no prev-close in packet), defer the first
+        // broadcast until prev-close is known — else UI sees close=0 and never
+        // updates (closingTickSent is one-shot off-hours). Futures/options still
+        // broadcast immediately since their packets carry richer state.
+        boolean isIndex = "INDEX".equals(type);
+        boolean waitingForPrevClose = isIndex && tick.getClose() <= 0;
 
         if (marketOpen) {
             closingTickSent.remove(tKey);
             log.info("[TICK] SYMBOL={}, TYPE={}, LTP={}, TIME={}",
                     symbol, type, fmt(ltp), fmtTime(ltt));
-            broadcast(tick, type);
+            if (!waitingForPrevClose) broadcast(tick, type);
         } else if (closingTickSent.add(tKey)) {
-            log.info("[CLOSING-TICK] SYMBOL={}, TYPE={}, LTP={}, TIME={}",
-                    symbol, type, fmt(ltp), fmtTime(ltt));
-            broadcast(tick, type);
+            log.info("[CLOSING-TICK] SYMBOL={}, TYPE={}, LTP={}, TIME={}, close={}",
+                    symbol, type, fmt(ltp), fmtTime(ltt), tick.getClose());
+            if (waitingForPrevClose) {
+                // Allow a later ticker/prev-close path to do the first broadcast.
+                closingTickSent.remove(tKey);
+            } else {
+                broadcast(tick, type);
+            }
         }
     }
 
@@ -549,7 +625,8 @@ public class MarketFeedService {
         float high  = buf.getFloat(42);
         float low   = buf.getFloat(46);
 
-        TickData tick = buildBaseTick(symbol, type, inst);
+        String tKey = tickKey(symbol, inst);
+        TickData tick = buildTickUpdate(tKey, symbol, type, inst);
         tick.setLtp(ltp);
         tick.setOpen(open);
         tick.setHigh(high);
@@ -561,8 +638,8 @@ public class MarketFeedService {
         tick.setSellQty(sellQ);
         tick.setLtq(ltq);
         tick.setTimestamp(fmtTime(ltt));
+        enrichTickWithPrevDayState(inst, tick);
 
-        String tKey = tickKey(symbol, inst);
         if (!storeTickIfSubscribed(inst, tKey, tick)) {
             return;
         }
@@ -604,7 +681,8 @@ public class MarketFeedService {
                 vol, fmt(atp), buyQ, sellQ, ltq));
         if (oi > 0) sb.append(String.format(", OI=%d", oi));
 
-        TickData tick = buildBaseTick(symbol, type, inst);
+        String tKey = tickKey(symbol, inst);
+        TickData tick = buildTickUpdate(tKey, symbol, type, inst);
         tick.setLtp(ltp);
         tick.setOpen(open);
         tick.setHigh(high);
@@ -631,6 +709,7 @@ public class MarketFeedService {
             }
         }
         tick.setTimestamp(fmtTime(ltt));
+        enrichTickWithPrevDayState(inst, tick);
 
         if (buf.remaining() >= 162) {
             sb.append(" | DEPTH:");
@@ -651,7 +730,6 @@ public class MarketFeedService {
         }
         sb.append(String.format(", TIME=%s", fmtTime(ltt)));
 
-        String tKey = tickKey(symbol, inst);
         if (!storeTickIfSubscribed(inst, tKey, tick)) {
             return;
         }
@@ -696,16 +774,35 @@ public class MarketFeedService {
         // Store previous day's closing OI as baseline for OI change calculation
         int securityId = buf.getInt(4);
         IndexInstrument inst;
+        TickData tickToBroadcast = null;
         synchronized (subscriptionStateLock) {
             inst = findSubscribedInstrumentBySecurityId(String.valueOf(securityId));
-        }
-        if (inst != null && prevOi > 0) {
-            synchronized (subscriptionStateLock) {
-                prevDayOi.put(inst.getSecurityId(), (long) prevOi);
+            if (inst != null) {
+                if (prevClose > 0) {
+                    prevDayClose.put(inst.getSecurityId(), (double) prevClose);
+                }
+                if (prevOi > 0) {
+                    prevDayOi.put(inst.getSecurityId(), (long) prevOi);
+                }
+
+                TickData existingTick = lastTicks.get(tickKey(symbol, inst));
+                if (existingTick != null) {
+                    enrichTickWithPrevDayState(inst, existingTick);
+                    tickToBroadcast = existingTick;
+                }
             }
         }
         log.info("[PREV_CLOSE] SYMBOL={}, PREV_CLOSE={}, PREV_OI={}",
                 symbol, fmt(prevClose), prevOi);
+        if (tickToBroadcast != null) {
+            log.info("[MERGED-BROADCAST] {} -> O={} H={} L={} C={} LTP={} OI={} prevOI={}",
+                    tickToBroadcast.getSymbol(),
+                    tickToBroadcast.getOpen(), tickToBroadcast.getHigh(),
+                    tickToBroadcast.getLow(), tickToBroadcast.getClose(),
+                    tickToBroadcast.getLtp(), tickToBroadcast.getOi(),
+                    tickToBroadcast.getPrevDayOi());
+            broadcast(tickToBroadcast, tickToBroadcast.getType());
+        }
     }
 
     private void handleDisconnectPacket(ByteBuffer buf) {
@@ -731,6 +828,37 @@ public class MarketFeedService {
             tick.setTradingSymbol(inst.getTradingSymbol());
         }
         return tick;
+    }
+
+    private TickData buildTickUpdate(String tickKey, String symbol, String type, IndexInstrument inst) {
+        synchronized (subscriptionStateLock) {
+            TickData existingTick = lastTicks.get(tickKey);
+            if (existingTick != null) {
+                TickData copy = new TickData();
+                BeanUtils.copyProperties(existingTick, copy);
+                return copy;
+            }
+        }
+        return buildBaseTick(symbol, type, inst);
+    }
+
+    private void enrichTickWithPrevDayState(IndexInstrument inst, TickData tick) {
+        if (inst == null || tick == null) {
+            return;
+        }
+
+        Double dayClose = prevDayClose.get(inst.getSecurityId());
+        if (dayClose != null && dayClose > 0) {
+            tick.setClose(dayClose);
+        }
+
+        Long dayOpenOi = prevDayOi.get(inst.getSecurityId());
+        if (dayOpenOi != null) {
+            tick.setPrevDayOi(dayOpenOi);
+            if (tick.getOi() > 0) {
+                tick.setOiChange(tick.getOi() - dayOpenOi);
+            }
+        }
     }
 
     private void broadcast(TickData tick, String type) {
@@ -804,6 +932,7 @@ public class MarketFeedService {
     private void removeSubscriptionState(Collection<String> stateKeys) {
         for (String stateKey : stateKeys) {
             subscribedInstruments.remove(stateKey);
+            prevDayClose.remove(extractSecurityId(stateKey));
             prevDayOi.remove(extractSecurityId(stateKey));
         }
         pruneUnsubscribedTicks();

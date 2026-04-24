@@ -505,6 +505,275 @@ public class MasterDataService {
         return 0;
     }
 
+    /**
+     * OHLC snapshot for a single instrument (spot index, stock, or future).
+     */
+    public record OhlcSnapshot(double open, double high, double low, double close, double ltp) {
+        public boolean isEmpty() { return open == 0 && high == 0 && low == 0 && close == 0; }
+    }
+
+    /**
+     * Fetch today's OHLC for a single instrument via Dhan Market Feed OHLC API.
+     * Response: {"data":{"IDX_I":{"13":{"last_price":...,"ohlc":{"open":..,"high":..,"low":..,"close":..}}}},"status":"success"}
+     */
+    public OhlcSnapshot fetchSpotOhlc(String exchangeSegment, String securityId) {
+        String body = "{\"" + exchangeSegment + "\":[" + securityId + "]}";
+        // NOTE: we call /v2/marketfeed/quote (NOT /marketfeed/ohlc).
+        // /marketfeed/ohlc returns TODAY's OHLC where `close` == today's last_price after session close,
+        // which is useless as a previous-day reference.
+        // /marketfeed/quote returns the same ohlc block but its `close` is the PREVIOUS trading day's close.
+        long[] backoffMs = {400L, 900L, 1800L};
+        for (int attempt = 0; attempt <= backoffMs.length; attempt++) {
+            try {
+                HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create("https://api.dhan.co/v2/marketfeed/quote"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .header("access-token", accessToken)
+                        .header("client-id", clientId)
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build();
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                int status = response.statusCode();
+                if (status == 200) {
+                    String json = response.body();
+                    log.info("[QUOTE-RAW] {}:{} -> {}", exchangeSegment, securityId,
+                            json.length() > 800 ? json.substring(0, 800) : json);
+                    OhlcSnapshot snap = parseOhlcResponse(json);
+                    // Some Dhan responses also carry an explicit "net_change" we can use to derive prev close
+                    // as a cross-check: prev_close = last_price - net_change.
+                    double netChange = extractJsonNumber(json, "\"net_change\":");
+                    double derivedPrev = snap.ltp() - netChange;
+                    log.info("Fetched QUOTE for {}:{} = O={} H={} L={} C(prev)={} LTP={} netChange={} derivedPrev={}",
+                            exchangeSegment, securityId,
+                            snap.open(), snap.high(), snap.low(), snap.close(), snap.ltp(),
+                            netChange, derivedPrev);
+                    // If ohlc.close looks suspicious (==ltp) but net_change exists, fall back to derived prev.
+                    double prevClose = snap.close();
+                    if ((prevClose == 0 || Math.abs(prevClose - snap.ltp()) < 0.005) && Math.abs(netChange) > 0.005) {
+                        log.warn("quote.ohlc.close ({}) looks like today's close; using last_price - net_change = {}",
+                                prevClose, derivedPrev);
+                        prevClose = derivedPrev;
+                    }
+                    return new OhlcSnapshot(snap.open(), snap.high(), snap.low(), prevClose, snap.ltp());
+                }
+                if (status == 429 && attempt < backoffMs.length) {
+                    long wait = backoffMs[attempt];
+                    log.warn("Quote API rate-limited (HTTP 429) for {}:{} — retrying in {}ms (attempt {}/{})",
+                            exchangeSegment, securityId, wait, attempt + 1, backoffMs.length);
+                    try { Thread.sleep(wait); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    continue;
+                }
+                log.warn("Quote API returned HTTP {}: {}", status,
+                        response.body().substring(0, Math.min(200, response.body().length())));
+                return new OhlcSnapshot(0, 0, 0, 0, 0);
+            } catch (Exception e) {
+                log.warn("Failed to fetch Quote for {}:{} — {}", exchangeSegment, securityId, e.getMessage());
+                return new OhlcSnapshot(0, 0, 0, 0, 0);
+            }
+        }
+        return new OhlcSnapshot(0, 0, 0, 0, 0);
+    }
+
+    private static double extractJsonNumber(String json, String key) {
+        int idx = json.indexOf(key);
+        if (idx < 0) return 0;
+        int start = idx + key.length();
+        int end = start;
+        while (end < json.length()) {
+            char c = json.charAt(end);
+            if (c == ',' || c == '}' || c == ']') break;
+            end++;
+        }
+        try {
+            return Double.parseDouble(json.substring(start, end).trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Per-instrument row from a batched /v2/marketfeed/quote call.
+     *   open/high/low/close - today's OHLC as returned by Dhan
+     *   ltp                 - last_price
+     *   oi                  - current open interest (0 for equity/index)
+     *   netChange           - absolute change vs previous day close (0 off-hours)
+     *   prevClose           - derived previous-day close: (ltp - netChange) when netChange!=0, else ohlc.close
+     */
+    public record QuoteRow(double open, double high, double low, double close,
+                           double ltp, long oi, double netChange, double prevClose) {
+        public boolean isEmpty() {
+            return ltp == 0 && open == 0 && high == 0 && low == 0 && close == 0 && oi == 0;
+        }
+    }
+
+    /**
+     * Batched quote fetch: a single POST to /v2/marketfeed/quote for multiple instruments
+     * across multiple exchange segments (up to 1000 per Dhan docs).
+     * Returns a map keyed by securityId. Missing instruments are absent from the map.
+     */
+    public Map<String, QuoteRow> fetchQuoteBatch(Map<String, List<String>> segmentToSecurityIds) {
+        Map<String, QuoteRow> result = new HashMap<>();
+        if (segmentToSecurityIds == null || segmentToSecurityIds.isEmpty()) return result;
+
+        StringBuilder body = new StringBuilder("{");
+        boolean firstSeg = true;
+        int totalIds = 0;
+        for (Map.Entry<String, List<String>> e : segmentToSecurityIds.entrySet()) {
+            if (e.getValue() == null || e.getValue().isEmpty()) continue;
+            if (!firstSeg) body.append(',');
+            firstSeg = false;
+            body.append('"').append(e.getKey()).append("\":[");
+            for (int i = 0; i < e.getValue().size(); i++) {
+                if (i > 0) body.append(',');
+                body.append(e.getValue().get(i));
+                totalIds++;
+            }
+            body.append(']');
+        }
+        body.append('}');
+
+        long[] backoffMs = {400L, 900L, 1800L};
+        for (int attempt = 0; attempt <= backoffMs.length; attempt++) {
+            try {
+                HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create("https://api.dhan.co/v2/marketfeed/quote"))
+                        .timeout(Duration.ofSeconds(10))
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .header("access-token", accessToken)
+                        .header("client-id", clientId)
+                        .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                        .build();
+                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                int status = response.statusCode();
+                if (status == 200) {
+                    String json = response.body();
+                    log.info("[QUOTE-BATCH-RAW] {} instruments -> {}", totalIds,
+                            json.length() > 1200 ? json.substring(0, 1200) + "...[truncated]" : json);
+                    for (Map.Entry<String, List<String>> e : segmentToSecurityIds.entrySet()) {
+                        for (String secId : e.getValue()) {
+                            QuoteRow row = parseQuoteRow(json, secId);
+                            if (row != null) result.put(secId, row);
+                        }
+                    }
+                    log.info("[QUOTE-BATCH] Parsed {} of {} requested instruments", result.size(), totalIds);
+                    return result;
+                }
+                if (status == 429 && attempt < backoffMs.length) {
+                    long wait = backoffMs[attempt];
+                    log.warn("Quote batch rate-limited (HTTP 429) for {} instruments — retrying in {}ms (attempt {}/{})",
+                            totalIds, wait, attempt + 1, backoffMs.length);
+                    try { Thread.sleep(wait); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    continue;
+                }
+                log.warn("Quote batch API returned HTTP {}: {}", status,
+                        response.body().substring(0, Math.min(200, response.body().length())));
+                return result;
+            } catch (Exception e) {
+                log.warn("Failed batched Quote fetch for {} instruments — {}", totalIds, e.getMessage());
+                return result;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Extract the per-instrument block for securityId from a Dhan quote response using
+     * brace-balanced scanning, then parse its fields. Returns null if securityId isn't found.
+     */
+    static QuoteRow parseQuoteRow(String json, String securityId) {
+        if (json == null || securityId == null) return null;
+        String marker = "\"" + securityId + "\":{";
+        int idx = json.indexOf(marker);
+        if (idx < 0) return null;
+        int start = idx + marker.length() - 1; // position at opening '{'
+        int depth = 0;
+        int end = -1;
+        boolean inString = false;
+        boolean escape = false;
+        for (int i = start; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (escape) { escape = false; continue; }
+            if (c == '\\') { escape = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) { end = i; break; }
+            }
+        }
+        if (end < 0) return null;
+        String block = json.substring(start, end + 1);
+
+        double ltp       = extractJsonNumber(block, "\"last_price\":");
+        double netChange = extractJsonNumber(block, "\"net_change\":");
+        double open = 0, high = 0, low = 0, close = 0;
+        int ohlcIdx = block.indexOf("\"ohlc\"");
+        if (ohlcIdx >= 0) {
+            int ohlcEnd = block.indexOf('}', ohlcIdx);
+            String ohlcBlock = ohlcEnd > 0 ? block.substring(ohlcIdx, ohlcEnd + 1) : block.substring(ohlcIdx);
+            open  = extractJsonNumber(ohlcBlock, "\"open\":");
+            high  = extractJsonNumber(ohlcBlock, "\"high\":");
+            low   = extractJsonNumber(ohlcBlock, "\"low\":");
+            close = extractJsonNumber(ohlcBlock, "\"close\":");
+        }
+        // Extract standalone "oi" (skip "previous_oi"/"oi_day_high"/"oi_day_low").
+        long oi = 0;
+        int oiIdx = 0;
+        while ((oiIdx = block.indexOf("\"oi\":", oiIdx)) >= 0) {
+            if (oiIdx == 0 || block.charAt(oiIdx - 1) != '_') {
+                int vStart = oiIdx + "\"oi\":".length();
+                int vEnd = vStart;
+                while (vEnd < block.length()) {
+                    char c = block.charAt(vEnd);
+                    if (c == ',' || c == '}' || c == ']') break;
+                    vEnd++;
+                }
+                try { oi = Long.parseLong(block.substring(vStart, vEnd).trim()); } catch (NumberFormatException ignored) {}
+                break;
+            }
+            oiIdx += 5;
+        }
+
+        // Prev-close derivation:
+        //   - Intraday: Dhan sends net_change, so prev = ltp - netChange (reliable).
+        //   - Off-hours: Dhan sends net_change=0 AND ohlc.close==ltp (useless). Return 0 so
+        //     the caller leaves prevDayClose unseeded and lets the WS prev-close packet
+        //     (handlePrevClosePacket) populate the correct value from Dhan's binary feed.
+        double prevClose;
+        if (Math.abs(netChange) > 0.005 && ltp > 0) {
+            prevClose = ltp - netChange;
+        } else if (close > 0 && ltp > 0 && Math.abs(close - ltp) < 0.005) {
+            prevClose = 0; // unreliable — defer to WS prev-close packet
+        } else {
+            prevClose = close;
+        }
+        return new QuoteRow(open, high, low, close, ltp, oi, netChange, prevClose);
+    }
+
+    /**
+     * Parse a Dhan /v2/marketfeed/ohlc response body into an OhlcSnapshot.
+     * Exposed (package-private) for unit tests.
+     */
+    static OhlcSnapshot parseOhlcResponse(String json) {
+        if (json == null || json.isEmpty()) return new OhlcSnapshot(0, 0, 0, 0, 0);
+        double ltp = extractJsonNumber(json, "\"last_price\":");
+        int ohlcIdx = json.indexOf("\"ohlc\"");
+        if (ohlcIdx < 0) return new OhlcSnapshot(0, 0, 0, 0, ltp);
+        int blockEnd = json.indexOf('}', ohlcIdx);
+        String block = blockEnd > 0 ? json.substring(ohlcIdx, blockEnd + 1) : json.substring(ohlcIdx);
+        double open  = extractJsonNumber(block, "\"open\":");
+        double high  = extractJsonNumber(block, "\"high\":");
+        double low   = extractJsonNumber(block, "\"low\":");
+        double close = extractJsonNumber(block, "\"close\":");
+        return new OhlcSnapshot(open, high, low, close, ltp);
+    }
+
     private double guessAtmPrice(List<IndexInstrument> options) {
         List<Double> strikes = options.stream()
                 .map(i -> parseStrike(i.getStrikePrice()))
