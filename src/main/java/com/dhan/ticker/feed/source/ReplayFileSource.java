@@ -48,6 +48,14 @@ public class ReplayFileSource implements FrameSource {
 
     public enum State { IDLE, PLAYING, PAUSED, STOPPED }
 
+    /**
+     * Wall-clock threshold above which a gap between consecutive recorded
+     * frames is treated as "dead air" and skipped (re-anchoring the timing
+     * baseline) instead of slept through. Keeps high-speed playback smooth
+     * across low-activity windows in the source data.
+     */
+    private static final long IDLE_SKIP_NANOS = 100L * 1_000_000L; // 100 ms
+
     private final SessionDiscoveryService discovery;
     private final FrameIndexStream indexStream;
     private final TickStateService stateService;
@@ -254,6 +262,18 @@ public class ReplayFileSource implements FrameSource {
                 long targetElapsedNanos = (long) ((e.timestampNanos() - firstTs) / speed);
                 long actualElapsedNanos = System.nanoTime() - startNanos;
                 long sleepNanos = targetElapsedNanos - actualElapsedNanos;
+
+                // Skip dead air: when the next frame is more than IDLE_SKIP_MS
+                // of wall-clock away, collapse the gap by re-anchoring instead
+                // of sleeping. Prevents 2-3 s "stutters" during lunch lulls
+                // / low-activity windows at high replay speeds, while keeping
+                // relative timing accurate within active bursts.
+                if (sleepNanos > IDLE_SKIP_NANOS) {
+                    firstTs = e.timestampNanos();
+                    startNanos = System.nanoTime();
+                    sleepNanos = 0;
+                }
+
                 if (sleepNanos > 0) {
                     try {
                         long ms = sleepNanos / 1_000_000L;
