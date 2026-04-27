@@ -467,6 +467,20 @@ public class TickStateService {
         tick.setLtq(ltq);
         tick.setOi(oi);
         if (oi > 0 && inst != null) {
+            // In replay mode, options/futures have no MasterData preload of
+            // previous_oi and recorded sessions don't carry rc=6 PrevClose
+            // frames — baseline from first observed OI instead so oiChange
+            // is non-zero in the UI.
+            if (replayMode.get() && !prevDayOi.containsKey(inst.getSecurityId())) {
+                String t = detectType(inst);
+                if ("FUTURE".equals(t) || "OPTION".equals(t)) {
+                    synchronized (subscriptionStateLock) {
+                        prevDayOi.putIfAbsent(inst.getSecurityId(), (long) oi);
+                    }
+                    log.info("[OI-BASELINE] (full) baseline {} for {} {}",
+                            oi, t, inst.getTradingSymbol());
+                }
+            }
             Long dayOpenOi = prevDayOi.get(inst.getSecurityId());
             if (dayOpenOi != null) {
                 tick.setPrevDayOi(dayOpenOi);
@@ -517,12 +531,20 @@ public class TickStateService {
         }
         if (inst != null && oi > 0 && !prevDayOi.containsKey(inst.getSecurityId())) {
             String type = detectType(inst);
-            if ("FUTURE".equals(type)) {
+            // Live mode preloads option prevDayOi via MasterDataService
+            // (option-chain previous_oi). Replay sessions don't carry rc=6
+            // PrevClose frames, so options would otherwise have no baseline
+            // and oiChange would stay at 0 in the UI. In replay mode, fall
+            // back to baselining options from their first observed OI —
+            // same approach already used for futures.
+            boolean shouldBaseline = "FUTURE".equals(type)
+                    || (replayMode.get() && "OPTION".equals(type));
+            if (shouldBaseline) {
                 synchronized (subscriptionStateLock) {
                     prevDayOi.put(inst.getSecurityId(), (long) oi);
                 }
-                log.info("[OI-BASELINE] Using first OI snapshot {} as baseline for future {}",
-                        oi, inst.getTradingSymbol());
+                log.info("[OI-BASELINE] Using first OI snapshot {} as baseline for {} {}",
+                        oi, type, inst.getTradingSymbol());
             }
         }
         log.info("[OI] SYMBOL={}, OI={}", symbol, oi);
