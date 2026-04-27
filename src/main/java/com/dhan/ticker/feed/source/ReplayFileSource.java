@@ -21,8 +21,10 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -54,6 +56,7 @@ public class ReplayFileSource implements FrameSource {
 
     private final AtomicReference<State> state = new AtomicReference<>(State.IDLE);
     private final AtomicReference<String> currentSessionId = new AtomicReference<>();
+    private final AtomicReference<String> currentIndexFilter = new AtomicReference<>();
     private final AtomicLong framesPushed = new AtomicLong(0);
     private final AtomicLong currentTimestampNanos = new AtomicLong(0);
     private final AtomicBoolean stopRequested = new AtomicBoolean(false);
@@ -79,6 +82,22 @@ public class ReplayFileSource implements FrameSource {
     // ── Public lifecycle ──────────────────────────────────────────────────
 
     public synchronized void start(String sessionId, double speed) {
+        start(sessionId, speed, null);
+    }
+
+    /**
+     * Start playback. When {@code indexFilter} is non-null, only the
+     * instruments belonging to that parent index (spot + derivatives +
+     * cached constituent equities) are seeded into
+     * {@link TickStateService#subscribedInstruments}. Frames for any other
+     * instrument still flow through the pipeline but are silently dropped
+     * downstream because the state service short-circuits on unsubscribed
+     * lookups. This keeps source-side logic simple and identical to live.
+     *
+     * @throws WebSocketException if {@code indexFilter} is non-null and not
+     *         present in the session's basket.
+     */
+    public synchronized void start(String sessionId, double speed, String indexFilter) {
         if (state.get() == State.PLAYING || state.get() == State.PAUSED) {
             throw new WebSocketException("Replay already active: session=" + currentSessionId.get()
                     + " state=" + state.get() + ". Call /stop first.");
@@ -89,15 +108,43 @@ public class ReplayFileSource implements FrameSource {
         Path sessionDir = discovery.resolveSessionDir(sessionId);
         SessionManifest manifest = discovery.getManifest(sessionId);
 
-        // Seed instruments + flip into replay mode so isMarketOpen returns true
-        // and broadcast follows the same path as live.
+        // Build all groups, then narrow if a filter is provided.
+        Map<String, Set<String>> allGroups = buildGroups(manifest);
+        final String normalizedFilter;
+        if (indexFilter != null && !indexFilter.isBlank()) {
+            normalizedFilter = indexFilter.trim().toUpperCase();
+            if (!allGroups.containsKey(normalizedFilter)) {
+                throw new WebSocketException("Index '" + indexFilter + "' not in session '"
+                        + sessionId + "'. Available: " + allGroups.keySet());
+            }
+        } else {
+            normalizedFilter = null;
+        }
+
+        // Seed only the instruments visible to the active filter (or all).
+        List<IndexInstrument> seedInstruments;
+        Map<String, Set<String>> activeGroups;
+        if (normalizedFilter != null) {
+            Set<String> allowKeys = allGroups.get(normalizedFilter);
+            seedInstruments = toIndexInstruments(manifest).stream()
+                    .filter(i -> allowKeys.contains(i.getExchangeSegment() + ":" + i.getSecurityId()))
+                    .toList();
+            activeGroups = Map.of(normalizedFilter, allowKeys);
+        } else {
+            seedInstruments = toIndexInstruments(manifest);
+            activeGroups = allGroups;
+        }
+
         stateService.replayClearSubscribedInstruments();
-        stateService.replaySeedSubscribedInstruments(toIndexInstruments(manifest));
-        seedSubscriptionGroups(manifest);
+        stateService.replaySeedSubscribedInstruments(seedInstruments);
+        for (Map.Entry<String, Set<String>> e : activeGroups.entrySet()) {
+            stateService.registerGroup(e.getKey(), e.getValue());
+        }
         stateService.setReplayMode(true);
         pipeline.resume();
 
         currentSessionId.set(sessionId);
+        currentIndexFilter.set(normalizedFilter);
         framesPushed.set(0);
         currentTimestampNanos.set(0);
         stopRequested.set(false);
@@ -115,8 +162,9 @@ public class ReplayFileSource implements FrameSource {
         playbackThread = t;
         t.start();
 
-        log.info("[REPLAY] Started session={} speed={}x instruments={}",
-                sessionId, speed, manifest.getInstruments() == null ? 0 : manifest.getInstruments().size());
+        log.info("[REPLAY] Started session={} speed={}x indexFilter={} seededInstruments={}",
+                sessionId, speed, normalizedFilter == null ? "ALL" : normalizedFilter,
+                seedInstruments.size());
     }
 
     public synchronized void pause() {
@@ -146,6 +194,7 @@ public class ReplayFileSource implements FrameSource {
         state.set(State.STOPPED);
         stateService.setReplayMode(false);
         stateService.replayClearSubscribedInstruments();
+        currentIndexFilter.set(null);
         log.info("[REPLAY] Stopped");
     }
 
@@ -157,6 +206,7 @@ public class ReplayFileSource implements FrameSource {
 
     public State getState()             { return state.get(); }
     public String getCurrentSessionId() { return currentSessionId.get(); }
+    public String getCurrentIndexFilter() { return currentIndexFilter.get(); }
     public long getFramesPushed()       { return framesPushed.get(); }
     public long getCurrentTimestampNanos() { return currentTimestampNanos.get(); }
 
@@ -322,6 +372,10 @@ public class ReplayFileSource implements FrameSource {
      * {@code /api/instruments/subscribed-groups} and silently drops every
      * equity tick because no index→stock mapping exists.
      *
+     * <p>Returns parent-index → segment-qualified state keys for every
+     * instrument that belongs to that index in this session. Public so
+     * controllers can list available indices without starting playback.
+     *
      * <p>Strategy: derive parent index names from {@code basketPreset}
      * (e.g. {@code "BANKNIFTY_FULL+NIFTY50_FULL" -> [BANKNIFTY, NIFTY]}),
      * then for each parent build a state-key set containing
@@ -330,24 +384,19 @@ public class ReplayFileSource implements FrameSource {
      * {@link MasterDataService#getIndexConstituents}, intersected with the
      * actual instruments recorded in this session.
      */
-    private void seedSubscriptionGroups(SessionManifest manifest) {
+    public Map<String, Set<String>> buildGroups(SessionManifest manifest) {
+        Map<String, Set<String>> result = new LinkedHashMap<>();
         List<String> parents = parseParentIndices(manifest.getBasketPreset());
         if (parents.isEmpty() || manifest.getInstruments() == null) {
-            log.warn("[REPLAY] No basket parents derived from preset='{}' — equity grouping skipped",
-                    manifest.getBasketPreset());
-            return;
+            return result;
         }
 
-        // All securityIds (segment-qualified) actually present in the manifest.
-        Set<String> manifestKeys = new HashSet<>();
+        // Equity ids actually present in the manifest (used to filter constituents).
         Set<String> manifestEquityIds = new HashSet<>();
         for (SessionManifest.InstrumentEntry e : manifest.getInstruments()) {
             if (e == null || e.getExchangeSegment() == null) continue;
-            String sid = String.valueOf(e.getSecurityId());
-            String key = e.getExchangeSegment() + ":" + sid;
-            manifestKeys.add(key);
             if ("EQUITY".equalsIgnoreCase(e.getInstrumentType())) {
-                manifestEquityIds.add(sid);
+                manifestEquityIds.add(String.valueOf(e.getSecurityId()));
             }
         }
 
@@ -370,24 +419,21 @@ public class ReplayFileSource implements FrameSource {
             // (c) constituent equities — cached CSV lookup, intersect with manifest
             try {
                 List<IndexInstrument> constituents = masterData.getIndexConstituents(parent);
-                int matched = 0;
                 for (IndexInstrument c : constituents) {
                     if (c == null || c.getSecurityId() == null) continue;
                     if (manifestEquityIds.contains(c.getSecurityId())) {
                         groupKeys.add(c.getExchangeSegment() + ":" + c.getSecurityId());
-                        matched++;
                     }
                 }
-                log.info("[REPLAY] Group '{}': {} derivatives + {} equity constituents matched",
-                        parent, groupKeys.size() - matched, matched);
             } catch (Exception ex) {
                 log.warn("[REPLAY] Could not load constituents for {}: {}", parent, ex.getMessage());
             }
 
             if (!groupKeys.isEmpty()) {
-                stateService.registerGroup(parent, groupKeys);
+                result.put(parent, groupKeys);
             }
         }
+        return result;
     }
 
     /**

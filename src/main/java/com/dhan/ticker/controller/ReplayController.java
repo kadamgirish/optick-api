@@ -73,17 +73,48 @@ public class ReplayController {
         return ResponseEntity.ok(indexStream.computeStats(sessionId, discovery.resolveSessionDir(sessionId)));
     }
 
+    @GetMapping("/sessions/{sessionId}/indices")
+    @Operation(summary = "Parent indices available in a recorded session",
+            description = "Returns the indices derivable from the manifest's basketPreset " +
+                    "(e.g. BANKNIFTY_FULL+NIFTY50_FULL → [BANKNIFTY, NIFTY]) along with the " +
+                    "count of instruments (spot + derivatives + cached constituent equities) " +
+                    "each one resolves to. Use the 'name' value as the 'index' query param on /start.")
+    public ResponseEntity<List<Map<String, Object>>> indices(@PathVariable String sessionId) {
+        SessionManifest m = discovery.getManifest(sessionId);
+        Map<String, java.util.Set<String>> groups = source.buildGroups(m);
+        List<Map<String, Object>> out = groups.entrySet().stream()
+                .<Map<String, Object>>map(e -> Map.of(
+                        "name", e.getKey(),
+                        "instrumentCount", e.getValue().size()))
+                .toList();
+        return ResponseEntity.ok(out);
+    }
+
     // ── Playback control ─────────────────────────────────────────────────
 
     @PostMapping("/start")
     @Operation(summary = "Start replaying a session through the live tick pipeline",
             description = "Pushes recorded raw frames into the same decode/enrich/broadcast path as live data. " +
-                    "Single active session at a time — call /stop first to switch.")
+                    "Single active session at a time — call /stop first to switch. " +
+                    "Optional 'index' param restricts playback to one parent index (spot + derivatives + " +
+                    "constituent equities); omit for all indices in the basket.")
     public ResponseEntity<ApiResponse> start(
             @RequestParam String session,
-            @RequestParam(required = false, defaultValue = "1.0") double speed) {
-        source.start(session, speed);
-        return ResponseEntity.ok(ApiResponse.ok("Replay started: " + session + " @ " + speed + "x"));
+            @RequestParam(required = false, defaultValue = "1.0") double speed,
+            @RequestParam(required = false) String index) {
+        // Validate unknown index up-front so the client gets 400, not 500.
+        if (index != null && !index.isBlank()) {
+            SessionManifest m = discovery.getManifest(session);
+            Map<String, java.util.Set<String>> groups = source.buildGroups(m);
+            if (!groups.containsKey(index.trim().toUpperCase())) {
+                return ResponseEntity.badRequest().body(ApiResponse.error(
+                        "Index '" + index + "' not in session '" + session
+                                + "'. Available: " + groups.keySet()));
+            }
+        }
+        source.start(session, speed, index);
+        String suffix = (index == null || index.isBlank()) ? "" : " [index=" + index.trim().toUpperCase() + "]";
+        return ResponseEntity.ok(ApiResponse.ok("Replay started: " + session + " @ " + speed + "x" + suffix));
     }
 
     @PostMapping("/pause")
@@ -110,11 +141,12 @@ public class ReplayController {
     @GetMapping("/status")
     @Operation(summary = "Current replay state")
     public ResponseEntity<Map<String, Object>> status() {
-        return ResponseEntity.ok(Map.of(
-                "state", source.getState().name(),
-                "sessionId", source.getCurrentSessionId() == null ? "" : source.getCurrentSessionId(),
-                "framesPushed", source.getFramesPushed(),
-                "currentTimestampNanos", source.getCurrentTimestampNanos()
-        ));
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("state", source.getState().name());
+        body.put("sessionId", source.getCurrentSessionId() == null ? "" : source.getCurrentSessionId());
+        body.put("framesPushed", source.getFramesPushed());
+        body.put("currentTimestampNanos", source.getCurrentTimestampNanos());
+        body.put("indexFilter", source.getCurrentIndexFilter()); // null when unfiltered
+        return ResponseEntity.ok(body);
     }
 }
